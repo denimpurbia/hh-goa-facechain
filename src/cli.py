@@ -118,9 +118,10 @@ class TerminalFormatter:
 
     @classmethod
     def print_footer_no_match(cls) -> None:
-        """Print no match conclusion."""
+        """Print honest no match conclusion."""
         print("\n" + cls.DIVIDER)
-        print("NO VERIFIED MATCH FOUND")
+        print("[NO VERIFIED FACE MATCH FOUND]")
+        print("Search completed successfully, but no discovered candidate contained a verified matching face.")
         print(cls.DIVIDER)
 
     @classmethod

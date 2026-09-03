@@ -1,7 +1,7 @@
-"""Post matcher and face similarity verification module.
+"""Post matcher and deep face similarity verification module.
 
-Downloads discovered candidate public images, extracts facial embeddings,
-computes cosine similarity against the query face, and ranks candidates.
+Downloads discovered candidate public images, extracts deep facial embeddings,
+computes cosine similarity against the query face, and strictly filters out non-face candidates.
 """
 
 from dataclasses import dataclass
@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional
 import requests
 from PIL import Image
 
-from src.face_processor import FaceProcessor, compute_cosine_similarity
+from src.face_processor import FaceProcessor, NoFaceDetectedError, compute_cosine_similarity
 from src.hashing import calculate_sha256
 from src.reverse_search import SearchCandidate
 
@@ -75,7 +75,7 @@ class MatchResult:
 
 
 class PostMatcher:
-    """Coordinates candidate image downloading, face analysis, and ranking."""
+    """Coordinates candidate image downloading, face analysis, and strict biometric ranking."""
 
     def __init__(self, face_processor: FaceProcessor, timeout: int = 15, max_download_size_mb: int = 10):
         self.face_processor = face_processor
@@ -110,7 +110,6 @@ class PostMatcher:
                 from urllib.request import url2pathname
                 from urllib.parse import urlparse
                 parsed_path = url2pathname(urlparse(url).path)
-                # On Windows, fix leading slash if present (e.g. /D:/ -> D:/)
                 if len(parsed_path) > 3 and parsed_path[0] == "\\" and parsed_path[2] == ":":
                     parsed_path = parsed_path[1:]
                 local_p = Path(parsed_path)
@@ -135,7 +134,6 @@ class PostMatcher:
                     return None
 
                 content_type = resp.headers.get("Content-Type", "").lower()
-                # Accept common image content types
                 if content_type and not any(t in content_type for t in ["image", "octet-stream"]):
                     logger.debug(f"Skipping non-image content type ({content_type}) for {url}")
                     return None
@@ -164,14 +162,16 @@ class PostMatcher:
         self,
         candidates: List[SearchCandidate],
         input_embedding: Any,
-        threshold: float = 0.60,
+        threshold: float = 0.40,
     ) -> MatchResult:
-        """Download candidate images, detect faces, compute similarities, and rank.
+        """Download candidate images, detect faces, compute similarities, and rank strictly.
+
+        Rejects non-face images immediately without computing similarity.
 
         Args:
             candidates: List of discovered public search candidates.
             input_embedding: 1D numpy array of the input query face embedding.
-            threshold: Cosine similarity threshold for considering a match.
+            threshold: Cosine similarity threshold for considering a match (default: 0.40 for SFace).
 
         Returns:
             MatchResult instance containing best verified candidate and all evaluations.
@@ -187,7 +187,7 @@ class PostMatcher:
                 evaluations=[],
             )
 
-        # Re-order candidates to slightly prioritize recognized social/media domains
+        # Prioritize recognized social and media domains
         sorted_candidates = sorted(
             candidates,
             key=lambda c: (
@@ -236,9 +236,10 @@ class PostMatcher:
             img_sha256 = calculate_sha256(image_bytes)
 
             try:
+                # Genuine deep face detection and embedding
                 cand_face = self.face_processor.process_face(image_bytes)
                 similarity = compute_cosine_similarity(input_embedding, cand_face.embedding)
-                is_match = similarity >= threshold
+                is_match = bool(similarity >= threshold)
 
                 eval_record = CandidateEvaluation(
                     candidate=candidate,
@@ -249,14 +250,19 @@ class PostMatcher:
                     error_message=None,
                 )
                 evaluations.append(eval_record)
+                logger.info(
+                    f"Candidate evaluated: {candidate.source_domain} -> Face detected. "
+                    f"Similarity: {similarity:.4f} (Threshold: {threshold:.2f}, Match: {is_match})"
+                )
 
-                if similarity > best_similarity:
+                if is_match and similarity > best_similarity:
                     best_similarity = similarity
                     best_candidate = candidate
                     best_image_sha256 = img_sha256
                     best_image_bytes = image_bytes
 
-            except ValueError as val_err:
+            except (NoFaceDetectedError, ValueError) as val_err:
+                logger.info(f"Candidate rejected: no face detected in image for {candidate.url} ({val_err})")
                 evaluations.append(
                     CandidateEvaluation(
                         candidate=candidate,
@@ -264,7 +270,7 @@ class PostMatcher:
                         candidate_image_sha256=img_sha256,
                         is_match=False,
                         face_detected=False,
-                        error_message=f"Face analysis failed: {str(val_err)}",
+                        error_message="Candidate rejected: no face detected",
                     )
                 )
 
@@ -272,7 +278,7 @@ class PostMatcher:
         final_score = max(0.0, best_similarity) if best_candidate else 0.0
 
         return MatchResult(
-            best_candidate=best_candidate if is_match else (best_candidate if final_score > 0 else None),
+            best_candidate=best_candidate if is_match else None,
             similarity_score=final_score,
             threshold=threshold,
             is_match=is_match,

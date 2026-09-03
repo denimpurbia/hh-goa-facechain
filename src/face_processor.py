@@ -1,7 +1,9 @@
-"""Face detection, validation, primary face selection, and embedding extraction.
+"""Face detection, validation, primary face selection, and deep biometric embedding extraction.
 
-Supports InsightFace with seamless OpenCV DNN / Haar / Morphological fallback
-for maximum cross-platform compatibility and robustness across all environments.
+Uses OpenCV's native deep neural network models:
+- YuNet (FaceDetectorYN) for high-accuracy face and landmark detection.
+- SFace (FaceRecognizerSF) for 128-dimensional deep facial biometric embeddings.
+Strictly rejects non-face images without any heuristic or synthetic contrast fallbacks.
 """
 
 from dataclasses import dataclass
@@ -15,15 +17,21 @@ from PIL import Image
 logger = logging.getLogger("facechain.face_processor")
 
 
+class NoFaceDetectedError(ValueError):
+    """Raised when no genuine human face is detected in an image."""
+    pass
+
+
 @dataclass
 class FaceDetectionResult:
-    """Structured result of face detection and embedding extraction."""
+    """Structured result of genuine face detection and deep embedding extraction."""
 
     faces_detected: int
     detection_score: float
     embedding_dimension: int
     embedding: np.ndarray
     bounding_box: Tuple[int, int, int, int]  # (x, y, w, h)
+    landmarks: Optional[np.ndarray] = None  # 5 facial landmarks
 
     def to_dict(self, include_embedding: bool = False) -> Dict[str, Any]:
         """Convert to dictionary without exposing raw embedding unless explicitly requested."""
@@ -39,44 +47,65 @@ class FaceDetectionResult:
 
 
 class FaceProcessor:
-    """Detects faces, selects primary face, and extracts normalized embeddings."""
+    """Performs genuine deep face detection (YuNet) and biometric feature extraction (SFace)."""
 
-    def __init__(self, use_insightface: bool = True):
-        self._insightface_app = None
-        self._use_insightface = use_insightface
-        self._cascade_detector = None
+    DEFAULT_YUNET_PATH = Path("models/face_detection_yunet.onnx")
+    DEFAULT_SFACE_PATH = Path("models/face_recognition_sface.onnx")
 
-        if self._use_insightface:
-            self._try_init_insightface()
+    def __init__(
+        self,
+        yunet_path: Optional[Union[str, Path]] = None,
+        sface_path: Optional[Union[str, Path]] = None,
+        score_threshold: float = 0.6,
+        nms_threshold: float = 0.3,
+    ):
+        self.yunet_path = Path(yunet_path) if yunet_path else self.DEFAULT_YUNET_PATH
+        self.sface_path = Path(sface_path) if sface_path else self.DEFAULT_SFACE_PATH
+        self.score_threshold = score_threshold
+        self.nms_threshold = nms_threshold
 
-        self._init_opencv_detector()
+        self._detector: Optional[Any] = None
+        self._recognizer: Optional[Any] = None
 
-    def _try_init_insightface(self) -> None:
-        """Attempt to initialize InsightFace FaceAnalysis."""
-        try:
-            import insightface
-            from insightface.app import FaceAnalysis
+        self._init_models()
 
-            app = FaceAnalysis(name="buffalo_l", allowed_modules=["detection", "recognition"])
-            app.prepare(ctx_id=-1, det_size=(640, 640))
-            self._insightface_app = app
-            logger.info("InsightFace initialized successfully with CPU context.")
-        except Exception as e:
-            logger.warning(
-                f"InsightFace not available ({e}). Using OpenCV face analysis engine."
+    def _init_models(self) -> None:
+        """Initialize OpenCV FaceDetectorYN and FaceRecognizerSF from ONNX models."""
+        missing = []
+        if not self.yunet_path.is_file():
+            missing.append(f"YuNet model: {self.yunet_path}")
+        if not self.sface_path.is_file():
+            missing.append(f"SFace model: {self.sface_path}")
+
+        if missing:
+            err_msg = (
+                "DEEP LEARNING FACE MODELS REQUIRED:\n"
+                + "\n".join(f"  ❌ Missing {m}" for m in missing)
+                + "\n\nPlease download official OpenCV Zoo models by running:\n"
+                "    python scripts/download_models.py\n"
+                "Or manually place the ONNX models into the models/ folder:\n"
+                "    models/face_detection_yunet.onnx\n"
+                "    models/face_recognition_sface.onnx\n"
             )
-            self._insightface_app = None
+            logger.error(err_msg)
+            raise RuntimeError(err_msg)
 
-    def _init_opencv_detector(self) -> None:
-        """Initialize OpenCV face detector (CascadeClassifier if available)."""
-        if hasattr(cv2, "CascadeClassifier") and hasattr(cv2, "data") and hasattr(cv2.data, "haarcascades"):
-            try:
-                cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-                detector = cv2.CascadeClassifier(cascade_path)
-                if not detector.empty():
-                    self._cascade_detector = detector
-            except Exception:
-                self._cascade_detector = None
+        try:
+            self._detector = cv2.FaceDetectorYN.create(
+                model=str(self.yunet_path.resolve()),
+                config="",
+                input_size=(320, 320),
+                score_threshold=self.score_threshold,
+                nms_threshold=self.nms_threshold,
+                top_k=5000,
+            )
+            self._recognizer = cv2.FaceRecognizerSF.create(
+                model=str(self.sface_path.resolve()),
+                config="",
+            )
+            logger.info("Initialized YuNet Face Detector and SFace Face Recognizer successfully.")
+        except Exception as e:
+            raise RuntimeError(f"Failed to load OpenCV ONNX face models: {e}")
 
     def load_image(self, image_source: Union[str, Path, bytes, np.ndarray, Image.Image]) -> np.ndarray:
         """Load and validate an image into a standard BGR numpy array.
@@ -118,54 +147,59 @@ class FaceProcessor:
         return img
 
     def process_face(self, image_source: Union[str, Path, bytes, np.ndarray, Image.Image]) -> FaceDetectionResult:
-        """Detect faces in an image, select the primary face, and return embedding.
+        """Detect human faces in an image, select the primary face, and return deep embedding.
+
+        Strictly rejects non-face images by raising NoFaceDetectedError.
 
         Args:
             image_source: Image path, bytes, or ndarray.
 
         Returns:
-            FaceDetectionResult with detection confidence and normalized embedding.
+            FaceDetectionResult with detection confidence and normalized 128-d embedding.
 
         Raises:
-            ValueError: If no face is detected.
+            NoFaceDetectedError: If no genuine face is detected.
         """
         img_bgr = self.load_image(image_source)
+        h, w = img_bgr.shape[:2]
 
-        if self._insightface_app is not None:
-            try:
-                return self._process_with_insightface(img_bgr)
-            except Exception as e:
-                logger.warning(f"InsightFace processing failed ({e}). Falling back to OpenCV engine.")
+        if h < 20 or w < 20:
+            raise NoFaceDetectedError("Image dimensions too small for face detection.")
 
-        return self._process_with_opencv(img_bgr)
+        # Dynamically set input size for the YuNet detector
+        self._detector.setInputSize((w, h))
+        ret, faces = self._detector.detect(img_bgr)
 
-    def _process_with_insightface(self, img_bgr: np.ndarray) -> FaceDetectionResult:
-        """Process image using InsightFace model."""
-        faces = self._insightface_app.get(img_bgr)
-        if not faces:
-            raise ValueError("No face detected in the provided image.")
+        if faces is None or len(faces) == 0:
+            raise NoFaceDetectedError("No face detected in the provided image.")
 
-        # Select primary face: largest bounding box area & highest score
+        # Select primary face: largest bounding box area & highest detection score
+        # Face layout in YuNet: [x, y, w, h, x_re, y_re, x_le, y_le, x_nt, y_nt, x_rc, y_rc, x_lc, y_lc, score]
         primary_face = max(
             faces,
-            key=lambda f: (
-                (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]) * getattr(f, "det_score", 0.5)
-            ),
+            key=lambda f: float(max(0, f[2]) * max(0, f[3])) * float(f[14]),
         )
 
         bbox = (
-            int(primary_face.bbox[0]),
-            int(primary_face.bbox[1]),
-            int(primary_face.bbox[2] - primary_face.bbox[0]),
-            int(primary_face.bbox[3] - primary_face.bbox[1]),
+            int(primary_face[0]),
+            int(primary_face[1]),
+            int(primary_face[2]),
+            int(primary_face[3]),
         )
+        score = float(primary_face[14])
+        landmarks = primary_face[4:14].copy()
 
-        embedding = primary_face.embedding.astype(np.float32)
+        # Align and crop face using SFace recognizer
+        aligned_face = self._recognizer.alignCrop(img_bgr, primary_face)
+
+        # Extract 128-d deep facial biometric feature vector
+        raw_feature = self._recognizer.feature(aligned_face)
+        embedding = raw_feature.flatten().astype(np.float32)
+
+        # L2 unit normalization for exact cosine similarity comparison
         norm = np.linalg.norm(embedding)
         if norm > 0:
             embedding = embedding / norm
-
-        score = float(getattr(primary_face, "det_score", 0.95))
 
         return FaceDetectionResult(
             faces_detected=len(faces),
@@ -173,125 +207,8 @@ class FaceProcessor:
             embedding_dimension=len(embedding),
             embedding=embedding,
             bounding_box=bbox,
+            landmarks=landmarks,
         )
-
-    def _detect_faces_opencv(self, img_bgr: np.ndarray) -> List[Tuple[int, int, int, int]]:
-        """Detect face bounding boxes using CascadeClassifier or skin/chrominance analysis."""
-        h, w = img_bgr.shape[:2]
-        if h < 20 or w < 20:
-            return []
-
-        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-        gray_eq = cv2.equalizeHist(gray)
-
-        # 1. Try CascadeClassifier if loaded
-        if self._cascade_detector is not None:
-            faces = self._cascade_detector.detectMultiScale(
-                gray_eq,
-                scaleFactor=1.1,
-                minNeighbors=4,
-                minSize=(30, 30),
-                flags=cv2.CASCADE_SCALE_IMAGE,
-            )
-            if len(faces) > 0:
-                return [(int(x), int(y), int(bw), int(bh)) for (x, y, bw, bh) in faces]
-
-        # 2. Universal Face Region Localization (Skin Color & Edge/Feature Symmetry)
-        ycrcb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2YCrCb)
-        # Standard human skin chrominance range in YCrCb space
-        skin_mask = cv2.inRange(ycrcb, (0, 133, 77), (255, 173, 127))
-
-        # Morphological operations to clean skin mask
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-        skin_mask = cv2.morphologyEx(skin_mask, cv2.MORPH_OPEN, kernel, iterations=2)
-        skin_mask = cv2.morphologyEx(skin_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-
-        contours, _ = cv2.findContours(skin_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        candidate_boxes = []
-
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if area < (h * w * 0.03):  # Ignore tiny artifacts (< 3% of image)
-                continue
-
-            bx, by, bw, bh = cv2.boundingRect(cnt)
-            aspect_ratio = float(bh) / float(bw)
-
-            # Faces typically have vertical aspect ratio between 0.8 and 2.2
-            if 0.7 <= aspect_ratio <= 2.5:
-                # Check that the region has non-trivial internal texture/contrast (eyes, nose, mouth)
-                roi_gray = gray[by : by + bh, bx : bx + bw]
-                std_dev = np.std(roi_gray)
-                if std_dev > 10.0:  # Must have texture, not uniform flat color
-                    candidate_boxes.append((bx, by, bw, bh))
-
-        # If skin tone didn't trigger, check center contrast ellipse
-        if not candidate_boxes:
-            # Check if whole image has face-like central contrast (e.g. grayscale portraits)
-            std_all = np.std(gray)
-            if std_all > 20.0:
-                # Central region check
-                cx, cy = w // 2, h // 2
-                bw, bh = int(w * 0.6), int(h * 0.7)
-                bx, by = max(0, cx - bw // 2), max(0, cy - bh // 2)
-                candidate_boxes.append((bx, by, bw, bh))
-
-        return candidate_boxes
-
-    def _process_with_opencv(self, img_bgr: np.ndarray) -> FaceDetectionResult:
-        """Process image using OpenCV face detector and spatial feature descriptor."""
-        boxes = self._detect_faces_opencv(img_bgr)
-        if not boxes:
-            raise ValueError("No face detected in the provided image.")
-
-        # Select primary face: largest bounding box area (w * h)
-        primary_idx = int(np.argmax([bw * bh for (bx, by, bw, bh) in boxes]))
-        (x, y, w, h) = boxes[primary_idx]
-        bbox = (int(x), int(y), int(w), int(h))
-
-        # Extract normalized face crop (112x112 standard face resolution)
-        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-        face_crop = gray[max(0, y) : min(gray.shape[0], y + h), max(0, x) : min(gray.shape[1], x + w)]
-        if face_crop.size == 0:
-            raise ValueError("Invalid face crop extracted.")
-
-        face_crop_resized = cv2.resize(face_crop, (112, 112), interpolation=cv2.INTER_AREA)
-        face_crop_eq = cv2.equalizeHist(face_crop_resized)
-
-        # Extract 512-dimensional spatial frequency and DCT feature embedding
-        embedding = self._extract_spatial_embedding(face_crop_eq, dim=512)
-
-        # Calculate estimated detection confidence based on size and contrast
-        area_ratio = (w * h) / (img_bgr.shape[0] * img_bgr.shape[1] + 1e-6)
-        confidence = float(np.clip(0.85 + 0.14 * np.tanh(area_ratio * 10), 0.80, 0.99))
-
-        return FaceDetectionResult(
-            faces_detected=len(boxes),
-            detection_score=confidence,
-            embedding_dimension=len(embedding),
-            embedding=embedding,
-            bounding_box=bbox,
-        )
-
-    def _extract_spatial_embedding(self, face_gray_112: np.ndarray, dim: int = 512) -> np.ndarray:
-        """Generate a deterministic 512-d normalized facial feature descriptor."""
-        # 2D Discrete Cosine Transform (DCT) on face crop
-        float_crop = np.float32(face_gray_112) / 255.0
-        dct = cv2.dct(float_crop)
-
-        # Zig-zag / low-to-mid frequency selection for robust facial structure
-        dct_features = dct[:24, :24].flatten()  # 576 values
-        embedding = dct_features[:dim].astype(np.float32)
-
-        if len(embedding) < dim:
-            embedding = np.pad(embedding, (0, dim - len(embedding)))
-
-        # Unit normalization for cosine similarity
-        norm = np.linalg.norm(embedding)
-        if norm > 0:
-            embedding = embedding / norm
-
-        return embedding
 
 
 def compute_cosine_similarity(emb1: np.ndarray, emb2: np.ndarray) -> float:

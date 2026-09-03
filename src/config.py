@@ -70,11 +70,11 @@ def load_config() -> AppConfig:
         max_search_results = 10
 
     try:
-        threshold_val = float(os.getenv("FACE_MATCH_THRESHOLD", "0.60"))
+        threshold_val = float(os.getenv("FACE_MATCH_THRESHOLD", "0.40"))
         # Clamp threshold between 0.0 and 1.0
         face_match_threshold = max(0.0, min(1.0, threshold_val))
     except ValueError:
-        face_match_threshold = 0.60
+        face_match_threshold = 0.40
 
     blockchain_provider = os.getenv("BLOCKCHAIN_PROVIDER", "ethereum_tester").strip().lower()
     blockchain_rpc_url = os.getenv("BLOCKCHAIN_RPC_URL", "").strip() or None

@@ -140,11 +140,11 @@ def run_pipeline(
     )
 
     if not match_result.is_match or not match_result.best_candidate:
-        fmt.failure(f"No candidate passed match threshold ({match_threshold:.2f})")
+        fmt.failure(f"No candidate passed facial match threshold ({match_threshold:.2f})")
         if match_result.similarity_score > 0:
-            fmt.info("Highest similarity found", f"{match_result.similarity_score:.2f}")
+            fmt.info("Highest verified facial similarity", f"{match_result.similarity_score:.2f}")
         fmt.print_footer_no_match()
-        return 1
+        return 0
 
     best_cand = match_result.best_candidate
     cand_image_sha256 = match_result.candidate_image_sha256 or input_file_hash
