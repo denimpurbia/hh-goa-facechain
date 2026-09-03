@@ -1,0 +1,38 @@
+# Python bytecode and environments
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Environment and secrets
+.env
+.env.local
+*.key
+*.pem
+
+# IDEs and editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Test and coverage artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Results / Temporary generated data (keep directory structure)
+results/*
+!results/.gitkeep
+scratch/
+
+# Model weights and downloads
+*.onnx
+models/
+.insightface/

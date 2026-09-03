@@ -1,0 +1,22 @@
+# Computer Vision & Image Processing
+opencv-python>=4.8.0
+numpy>=1.24.0
+Pillow>=10.0.0
+
+# Optional High-Accuracy Biometric Face Recognition
+# (Fallback to OpenCV DNN Face Detection when InsightFace ONNX runtime is compiling)
+insightface>=0.7.3; python_version < "3.13"
+onnxruntime>=1.16.0; python_version < "3.13"
+
+# Networking & Search API
+requests>=2.31.0
+python-dotenv>=1.0.0
+
+# Blockchain & Cryptography
+web3>=6.11.0
+eth-tester>=0.9.0b1
+py-evm>=0.9.0b1
+eth-account>=0.9.0
+
+# Testing
+pytest>=7.4.0
