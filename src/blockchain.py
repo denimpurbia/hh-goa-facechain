@@ -96,6 +96,11 @@ class BlockchainVerifier:
         # Format as HexBytes payload (0x prefixed)
         tx_data = HexBytes("0x" + clean_hash)
 
+        try:
+            gas_price = self.w3.eth.gas_price
+        except Exception:
+            gas_price = 1000000000
+
         # Build transaction using default funded test account
         tx_params = {
             "from": self.default_account,
@@ -103,27 +108,33 @@ class BlockchainVerifier:
             "value": 0,
             "data": tx_data,
             "gas": 100000,
-            "gasPrice": self.w3.eth.gas_price if hasattr(self.w3.eth, "gas_price") else 1000000000,
+            "gasPrice": gas_price,
         }
 
         tx_hash_bytes = self.w3.eth.send_transaction(tx_params)
         tx_receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash_bytes)
 
-        block = self.w3.eth.get_block(tx_receipt.blockNumber)
-        tx_hash_hex = tx_receipt.transactionHash.hex()
+        block_num = getattr(tx_receipt, "blockNumber", tx_receipt.get("blockNumber") if hasattr(tx_receipt, "get") else 0)
+        block = self.w3.eth.get_block(block_num)
+
+        tx_hash_val = getattr(tx_receipt, "transactionHash", tx_receipt.get("transactionHash") if hasattr(tx_receipt, "get") else b"")
+        tx_hash_hex = tx_hash_val.hex() if hasattr(tx_hash_val, "hex") else str(tx_hash_val)
         if not tx_hash_hex.startswith("0x"):
             tx_hash_hex = "0x" + tx_hash_hex
 
-        logger.info(f"Recorded hash on blockchain. Tx: {tx_hash_hex}, Block: {tx_receipt.blockNumber}")
+        gas_used = int(getattr(tx_receipt, "gasUsed", tx_receipt.get("gasUsed", 0) if hasattr(tx_receipt, "get") else 0))
+        block_timestamp = int(getattr(block, "timestamp", block.get("timestamp", 0) if hasattr(block, "get") else 0))
+
+        logger.info(f"Recorded hash on blockchain. Tx: {tx_hash_hex}, Block: {block_num}")
 
         return BlockchainReceipt(
             data_hash=clean_hash,
             transaction_hash=tx_hash_hex,
-            block_number=tx_receipt.blockNumber,
-            block_timestamp=block.timestamp if hasattr(block, "timestamp") else 0,
+            block_number=block_num,
+            block_timestamp=block_timestamp,
             from_address=str(tx_params["from"]),
             to_address=str(tx_params["to"]),
-            gas_used=int(tx_receipt.gasUsed),
+            gas_used=gas_used,
             provider=self.provider_type,
         )
 
@@ -181,16 +192,27 @@ class BlockchainVerifier:
         try:
             tx = self.w3.eth.get_transaction(tx_hash_hex)
             receipt = self.w3.eth.get_transaction_receipt(tx_hash_hex)
-            block = self.w3.eth.get_block(receipt.blockNumber)
+            block_num = getattr(receipt, "blockNumber", receipt.get("blockNumber") if hasattr(receipt, "get") else 0)
+            block = self.w3.eth.get_block(block_num)
+
+            from_addr = getattr(tx, "from", tx.get("from") if hasattr(tx, "get") else "")
+            to_addr = getattr(tx, "to", tx.get("to") if hasattr(tx, "get") else None)
+            gas_used = int(getattr(receipt, "gasUsed", receipt.get("gasUsed", 0) if hasattr(receipt, "get") else 0))
+            status = getattr(receipt, "status", receipt.get("status") if hasattr(receipt, "get") else 1)
+            block_timestamp = int(getattr(block, "timestamp", block.get("timestamp", 0) if hasattr(block, "get") else 0))
+
+            input_data = getattr(tx, "input", tx.get("input") if hasattr(tx, "get") else getattr(tx, "data", tx.get("data", "")))
+            input_hex = input_data.hex() if hasattr(input_data, "hex") else str(input_data)
+
             return {
                 "transaction_hash": tx_hash_hex,
-                "block_number": receipt.blockNumber,
-                "block_timestamp": block.timestamp,
-                "from": tx["from"],
-                "to": tx.get("to"),
-                "gas_used": receipt.gasUsed,
-                "status": receipt.status,
-                "input_data": tx["input"].hex() if hasattr(tx["input"], "hex") else str(tx["input"]),
+                "block_number": block_num,
+                "block_timestamp": block_timestamp,
+                "from": str(from_addr),
+                "to": str(to_addr) if to_addr else None,
+                "gas_used": gas_used,
+                "status": status,
+                "input_data": input_hex,
             }
         except Exception as e:
             logger.debug(f"Error fetching tx details for {tx_hash_hex}: {e}")
